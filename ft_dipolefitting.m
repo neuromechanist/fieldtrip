@@ -165,6 +165,9 @@ cfg.gridsearch      = ft_getopt(cfg, 'gridsearch', 'yes');
 cfg.nonlinear       = ft_getopt(cfg, 'nonlinear', 'yes');
 cfg.symmetry        = ft_getopt(cfg, 'symmetry');
 cfg.dipfit          = ft_getopt(cfg, 'dipfit', []);     % the default for this is handled below
+cfg.useGPU = ft_getopt(cfg, 'useGPU', false); % Default is false
+cfg.useParfor = ft_getopt(cfg, 'useParfor', true); % Default is true
+cfg.useIterative = ft_getopt(cfg, 'useIterative', false); % Default is false
 
 cfg = ft_checkconfig(cfg, 'renamed',    {'tightgrid', 'tight'});  % this is moved to cfg.sourcemodel.tight by the subsequent createsubcfg
 cfg = ft_checkconfig(cfg, 'renamed',    {'sourceunits', 'unit'}); % this is moved to cfg.sourcemodel.unit  by the subsequent createsubcfg
@@ -411,42 +414,79 @@ if strcmp(cfg.gridsearch, 'yes')
       ft_error('unsupported cfg.model');
   end
   
-  insideindx = find(sourcemodel.inside);
-  ft_progress('init', cfg.feedback, 'scanning grid');
-  for i=1:length(insideindx)
-    ft_progress(i/length(insideindx), 'scanning grid location %d/%d\n', i, length(insideindx));
-    thisindx = insideindx(i);
-    if isfield(sourcemodel, 'leadfield')
-      % reuse the previously computed leadfield
-      lf = sourcemodel.leadfield{thisindx};
+    % Prepare to find sources
+    insideindx = find(sourcemodel.inside);
+    ft_progress('init', cfg.feedback, 'scanning grid');
+
+    % Initialize an array to store errors
+    if strcmp(cfg.model, 'regional')
+        errors = nan(length(insideindx), 1); % For regional model
     else
-      lf = ft_compute_leadfield(sourcemodel.pos(thisindx,:), sens, headmodel, leadfieldopt{:});
+        errors = nan(length(insideindx), ntime); % For moving model
     end
-    % the model is V=lf*mom+noise, therefore mom=pinv(lf)*V estimates the
-    % dipole moment this makes the model potential U=lf*pinv(lf)*V and the
-    % model error is norm(V-U) = norm(V-lf*pinv(lf)*V) = norm((eye-lf*pinv(lf))*V)
-    if any(isnan(lf(:)))
-      % this might happen if one of the dipole locations of the grid is
-      % outside the brain compartment
-      lf(:) = 0;
+
+    if cfg.useParfor
+        parfor i = 1:length(insideindx)
+            thisindx = insideindx(i);
+            local_pos = sourcemodel.pos(thisindx,:);
+
+            % Compute the leadfield for this grid index
+            if isfield(sourcemodel, 'leadfield')
+                lf = sourcemodel.leadfield{thisindx};
+            else
+                lf = ft_compute_leadfield(local_pos, sens, headmodel, leadfieldopt{:});
+            end
+            
+            % Handle NaN cases in leadfield
+            if any(isnan(lf(:)))
+                lf(:) = 0;
+            end
+
+            % Calculate model error based on the model type
+            switch cfg.model
+                case 'regional'
+                    errors(i) = sum(sum(((eye(nchans) - lf * pinv(lf)) * Vdata).^2));
+                case 'moving'
+                    % for t = 1:ntime
+                    %     errors(i, t) = sum(((eye(nchans) - lf * pinv(lf)) * Vdata(:, t)).^2);
+                    % end
+            end
+        end
+    else
+        for i = 1:length(insideindx)
+            thisindx = insideindx(i);
+            local_pos = sourcemodel.pos(thisindx,:);
+
+            % Compute the leadfield for this grid index
+            if isfield(sourcemodel, 'leadfield')
+                lf = sourcemodel.leadfield{thisindx};
+            else
+                lf = ft_compute_leadfield(local_pos, sens, headmodel, leadfieldopt{:});
+            end
+            
+            % Handle NaN cases in leadfield
+            if any(isnan(lf(:)))
+                lf(:) = 0;
+            end
+
+            % Calculate model error based on the model type
+            switch cfg.model
+                case 'regional'
+                    errors(i) = sum(sum(((eye(nchans) - lf * pinv(lf)) * Vdata).^2));
+                case 'moving'
+                    for t = 1:ntime
+                        errors(i, t) = sum(((eye(nchans) - lf * pinv(lf)) * Vdata(:, t)).^2);
+                    end
+            end
+        end
     end
+
+    ft_progress('close');
+
     switch cfg.model
-      case 'regional'
-        % sum the error over all latencies
-        sourcemodel.error(thisindx,1) = sum(sum(((eye(nchans)-lf*pinv(lf))*Vdata).^2));
-      case 'moving'
-        % remember the error for each latency independently
-        sourcemodel.error(thisindx,:) = sum(((eye(nchans)-lf*pinv(lf))*Vdata).^2);
-      otherwise
-        ft_error('unsupported cfg.model');
-    end % switch model
-  end % looping over the grid
-  ft_progress('close');
-  
-  switch cfg.model
     case 'regional'
       % find the source position with the minimum error
-      [err, indx] = min(sourcemodel.error);
+      [err, indx] = min(errors);
       dip.pos = sourcemodel.pos(indx,:);                % note that for a symmetric dipole pair this results in a vector
       dip.pos = reshape(dip.pos,3,cfg.numdipoles)';     % convert to a Nx3 array
       dip.mom = zeros(cfg.numdipoles*3,1);              % set the dipole moment to zero
@@ -462,7 +502,7 @@ if strcmp(cfg.gridsearch, 'yes')
     case 'moving'
       for t=1:ntime
         % find the source position with the minimum error
-        [err, indx] = min(sourcemodel.error(:,t));
+        [~, indx] = min(errors(:, t));
         dip(t).pos = sourcemodel.pos(indx,:);                 % note that for a symmetric dipole pair this results in a vector
         dip(t).pos = reshape(dip(t).pos,3,cfg.numdipoles)';   % convert to a Nx3 array
         dip(t).mom = zeros(cfg.numdipoles*3,1);               % set the dipole moment to zero
